@@ -12,6 +12,12 @@ class Settings(BaseSettings):
 
     allowed_origins: str = ""
 
+    # Kafka settings
+    kafka_bootstrap_servers: str = ""
+    kafka_producer_topic: str = ""
+    kafka_consumer_topic: str = ""
+    kafka_consumer_group: str = "app-consumer"
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
