@@ -6,6 +6,7 @@ from app.core.config import get_settings
 
 from .producer import init_producer, stop_producer, send_message, get_producer_sync
 from .consumer import KafkaConsumerManager
+from .handlers import default_handler
 
 
 class KafkaManager:
@@ -22,14 +23,11 @@ class KafkaManager:
         await init_producer(servers)
 
         if self.settings.kafka_consumer_topic:
-            async def _default_handler(msg):
-                logging.info("Received Kafka message on %s: %s", msg.topic, msg.value)
-
             self.consumer_manager = KafkaConsumerManager(
                 bootstrap_servers=servers,
                 topic=self.settings.kafka_consumer_topic,
                 group_id=self.settings.kafka_consumer_group,
-                handler=_default_handler,
+                handler=default_handler,
             )
             await self.consumer_manager.start()
 

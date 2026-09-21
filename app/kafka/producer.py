@@ -2,6 +2,7 @@ import asyncio
 from typing import Iterable, Optional
 
 from aiokafka import AIOKafkaProducer
+import logging
 
 _producer: Optional[AIOKafkaProducer] = None
 
@@ -25,7 +26,9 @@ async def send_message(topic: str, value: bytes, key: Optional[bytes] = None):
     if _producer is None:
         raise RuntimeError("Kafka producer is not initialized")
 
+    logging.info("Sending Kafka message to %s: %s", topic, value)
     await _producer.send_and_wait(topic, value=value, key=key)
+    logging.info("Kafka message sent to %s", topic)
 
 
 def get_producer_sync():
