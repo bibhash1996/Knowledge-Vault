@@ -1,3 +1,4 @@
+import sys
 from contextlib import nullcontext
 from pathlib import Path
 from shutil import copyfileobj
@@ -6,6 +7,11 @@ from typing import List
 from urllib.parse import urlsplit
 from urllib.request import urlopen
 import json
+
+if __package__ in (None, ""):
+    project_root = Path(__file__).resolve().parents[2]
+    if str(project_root) not in sys.path:
+        sys.path.insert(0, str(project_root))
 
 from unstructured.partition.pdf import partition_pdf
 from unstructured.chunking.title import chunk_by_title
@@ -16,9 +22,10 @@ from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_chroma import Chroma
 from langchain_core.messages import HumanMessage
 
+from app.db.vector_store import get_vector_store
+
 import dotenv
 dotenv.load_dotenv() 
-
 
 
 def partition_pdf_file(file_path: str) -> list:
@@ -155,8 +162,8 @@ def create_ai_enhanced_summary(text: str, tables: List[str], images: List[str]) 
             summary += f" [Contains {len(images)} image(s)]"
         return summary
 
-def summarise_chunks(chunks) -> List[Document]:
-    """Process all chunks with AI Summaries"""
+def summarise_chunks(chunks, file_url: str, session_id: int | None = None) -> List[Document]:
+    """Process all chunks with AI Summaries and tag each chunk to a session."""
     print("🧠 Processing chunks with AI Summaries...")
     
     langchain_documents: List[Document] = []
@@ -191,16 +198,21 @@ def summarise_chunks(chunks) -> List[Document]:
             print(f"     → Using raw text (no tables/images)")
             enhanced_content = content_data['text']
         
-        # Create LangChain Document with rich metadata
+        metadata = {
+            "original_content": json.dumps({
+                "raw_text": content_data['text'],
+                # the tables and images are exceeding the vector store limit, need to store it to the database instead
+                # "tables_html": content_data['tables'],
+                # "images_base64": content_data['images']
+            }),
+            "file_url": file_url,
+        }
+        if session_id is not None:
+            metadata["session_id"] = int(session_id)
+
         doc = Document(
             page_content=enhanced_content,
-            metadata={
-                "original_content": json.dumps({
-                    "raw_text": content_data['text'],
-                    "tables_html": content_data['tables'],
-                    "images_base64": content_data['images']
-                })
-            }
+            metadata=metadata,
         )
         
         langchain_documents.append(doc)
@@ -208,8 +220,41 @@ def summarise_chunks(chunks) -> List[Document]:
     print(f"✅ Processed {len(langchain_documents)} chunks")
     return langchain_documents
 
-def run_complete_ingestion_pipeline(pdf_path: str):
-    """Run the complete RAG ingestion pipeline"""
+
+def save_chunks_to_vector_store(chunks: List[Document], session_id: int) -> None:
+    """Persist session-scoped document chunks into the shared vector store."""
+    if not chunks:
+        print("ℹ️ No chunks to save to the vector store")
+        return
+
+    try:
+        vector_store = get_vector_store()
+    except Exception as exc:  # pragma: no cover - depends on external Pinecone configuration
+        print(f"⚠️ Skipping vector-store save for session_id={session_id}: {exc}")
+        return
+
+    tagged_documents = []
+    for doc in chunks:
+        metadata = dict(doc.metadata or {})
+        metadata["session_id"] = int(session_id)
+        tagged_documents.append(
+            Document(
+                page_content=doc.page_content,
+                metadata=metadata,
+            )
+        )
+
+    try:
+        vector_store.add_documents(tagged_documents)
+    except Exception as exc:  # pragma: no cover - depends on external Pinecone configuration
+        print(f"⚠️ Failed to save chunks to vector store for session_id={session_id}: {exc}")
+        return
+
+    print(f"✅ Saved {len(tagged_documents)} chunks to vector store for session_id={session_id}")
+
+
+def run_complete_ingestion_pipeline(pdf_path: str, session_id: int):
+    """Run the complete RAG ingestion pipeline and store session-scoped chunks."""
     print("🚀 Starting RAG Ingestion Pipeline")
     print("=" * 50)
     
@@ -220,8 +265,9 @@ def run_complete_ingestion_pipeline(pdf_path: str):
     chunks = create_chunks_by_title(elements)
     
     # Step 3: AI Summarisation
-    summarised_chunks = summarise_chunks(chunks)
-    print(summarised_chunks[0].metadata)
+    summarised_chunks = summarise_chunks(chunks, pdf_path, session_id=session_id)
+    save_chunks_to_vector_store(summarised_chunks, session_id=session_id)
+    # print(summarised_chunks[0].metadata)
     print(f"✅ Completed RAG Ingestion Pipeline with {len(summarised_chunks)} summarised chunks")
 
 if __name__ == "__main__":
@@ -230,4 +276,4 @@ if __name__ == "__main__":
     # file_path = "https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf"
     file_path = "https://www.sldttc.org/allpdf/21583473018.pdf"
     # partitioned_elements = partition_pdf_file(file_path)
-    chunked_elements = run_complete_ingestion_pipeline(file_path)
+    chunked_elements = run_complete_ingestion_pipeline(file_path, session_id=1)

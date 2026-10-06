@@ -12,6 +12,15 @@ class Settings(BaseSettings):
 
     allowed_origins: str = ""
 
+    # Pinecone vector store settings
+    pinecone_api_key: str = ""
+    pinecone_index_name: str = ""
+    pinecone_namespace: str = ""
+
+    # OpenAI API settings
+    openai_api_key: str = ""
+    openai_embedding_model: str = "text-embedding-3-small"
+
     # Kafka settings
     kafka_bootstrap_servers: str = ""
     kafka_producer_topic: str = ""
@@ -22,6 +31,7 @@ class Settings(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         case_sensitive=False,
+        extra="ignore",
     )
 
     @property
