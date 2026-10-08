@@ -8,6 +8,8 @@ from urllib.parse import urlsplit
 from urllib.request import urlopen
 import json
 
+from sqlalchemy.orm import Session
+
 if __package__ in (None, ""):
     project_root = Path(__file__).resolve().parents[2]
     if str(project_root) not in sys.path:
@@ -23,6 +25,8 @@ from langchain_chroma import Chroma
 from langchain_core.messages import HumanMessage
 
 from app.db.vector_store import get_vector_store
+from app.db.session import SessionLocal
+from app.repositories.original_content import OriginalContentRepository
 
 import dotenv
 dotenv.load_dotenv() 
@@ -162,12 +166,19 @@ def create_ai_enhanced_summary(text: str, tables: List[str], images: List[str]) 
             summary += f" [Contains {len(images)} image(s)]"
         return summary
 
-def summarise_chunks(chunks, file_url: str, session_id: int | None = None) -> List[Document]:
+def summarise_chunks(
+    chunks,
+    file_url: str,
+    session_id: int | None = None,
+    knowledge_id: int | None = None,
+    db: Session | None = None,
+) -> List[Document]:
     """Process all chunks with AI Summaries and tag each chunk to a session."""
     print("🧠 Processing chunks with AI Summaries...")
     
     langchain_documents: List[Document] = []
     total_chunks = len(chunks)
+    content_repository = OriginalContentRepository()
     
     for i, chunk in enumerate(chunks):
         current_chunk = i + 1
@@ -197,13 +208,35 @@ def summarise_chunks(chunks, file_url: str, session_id: int | None = None) -> Li
         else:
             print(f"     → Using raw text (no tables/images)")
             enhanced_content = content_data['text']
+
+        content_references = []
+        if content_data['tables'] or content_data['images']:
+            if db is None or session_id is None or knowledge_id is None:
+                raise ValueError(
+                    "Persisting tables or images requires a database session, "
+                    "session_id, and knowledge_id"
+                )
+
+            entries = [
+                ("table", value) for value in content_data["tables"]
+            ] + [
+                ("image", value) for value in content_data["images"]
+            ]
+            stored_content = content_repository.create_many(
+                db,
+                session_id=int(session_id),
+                knowledge_id=int(knowledge_id),
+                entries=entries,
+            )
+            content_references = [
+                {"entity_type": row.entity_type, "id": row.id}
+                for row in stored_content
+            ]
         
         metadata = {
             "original_content": json.dumps({
                 "raw_text": content_data['text'],
-                # the tables and images are exceeding the vector store limit, need to store it to the database instead
-                # "tables_html": content_data['tables'],
-                # "images_base64": content_data['images']
+                "content_references": content_references,
             }),
             "file_url": file_url,
         }
@@ -253,7 +286,11 @@ def save_chunks_to_vector_store(chunks: List[Document], session_id: int) -> None
     print(f"✅ Saved {len(tagged_documents)} chunks to vector store for session_id={session_id}")
 
 
-def run_complete_ingestion_pipeline(pdf_path: str, session_id: int):
+def run_complete_ingestion_pipeline(
+    pdf_path: str,
+    session_id: int,
+    knowledge_id: int | None = None,
+):
     """Run the complete RAG ingestion pipeline and store session-scoped chunks."""
     print("🚀 Starting RAG Ingestion Pipeline")
     print("=" * 50)
@@ -264,8 +301,23 @@ def run_complete_ingestion_pipeline(pdf_path: str, session_id: int):
     # Step 2: Chunk
     chunks = create_chunks_by_title(elements)
     
-    # Step 3: AI Summarisation
-    summarised_chunks = summarise_chunks(chunks, pdf_path, session_id=session_id)
+    # Step 3: AI Summarisation and persistence of large content blocks.
+    db = SessionLocal()
+    try:
+        summarised_chunks = summarise_chunks(
+            chunks,
+            pdf_path,
+            session_id=session_id,
+            knowledge_id=knowledge_id,
+            db=db,
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
     save_chunks_to_vector_store(summarised_chunks, session_id=session_id)
     # print(summarised_chunks[0].metadata)
     print(f"✅ Completed RAG Ingestion Pipeline with {len(summarised_chunks)} summarised chunks")
@@ -276,4 +328,4 @@ if __name__ == "__main__":
     # file_path = "https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf"
     file_path = "https://www.sldttc.org/allpdf/21583473018.pdf"
     # partitioned_elements = partition_pdf_file(file_path)
-    chunked_elements = run_complete_ingestion_pipeline(file_path, session_id=1)
+    chunked_elements = run_complete_ingestion_pipeline(file_path, session_id=1,knowledge_id=2)
