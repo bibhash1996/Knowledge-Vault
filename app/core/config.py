@@ -17,6 +17,11 @@ class Settings(BaseSettings):
     pinecone_index_name: str = ""
     pinecone_namespace: str = ""
 
+    # Elasticsearch BM25 settings
+    elasticsearch_url: str = ""
+    elasticsearch_api_key: str = ""
+    elasticsearch_index_name: str = "knowledge-chunks"
+
     # OpenAI API settings
     openai_api_key: str = ""
     openai_embedding_model: str = "text-embedding-3-small"

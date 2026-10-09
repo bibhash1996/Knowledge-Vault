@@ -8,10 +8,15 @@ from sqlalchemy.orm import Session
 
 from app.core.config import Settings
 from app.db.session import Base
+from app.db.elasticsearch_store import search_chunks
 from app.models.knowledge import Knowledge
 from app.models.original_content import OriginalContent
 from app.models.session import Session as SessionModel
-from app.services.partition import summarise_chunks, save_chunks_to_vector_store
+from app.services.partition import (
+    summarise_chunks,
+    save_chunks_to_keyword_search,
+    save_chunks_to_vector_store,
+)
 
 
 def test_settings_accepts_openai_api_key_from_env(monkeypatch):
@@ -33,7 +38,7 @@ def test_summarise_chunks_tags_session_id_in_metadata():
 
 
 @patch("app.services.partition.create_ai_enhanced_summary", return_value="summary")
-def test_summarise_chunks_persists_large_content_and_stores_references(_mock_summary):
+def test_summarise_chunks_persists_large_content_and_stores_references(mock_summary):
     engine = create_engine("sqlite://")
     Base.metadata.create_all(engine)
 
@@ -81,6 +86,7 @@ def test_summarise_chunks_persists_large_content_and_stores_references(_mock_sum
     ]
     assert "tables_html" not in original_content
     assert "images_base64" not in original_content
+    mock_summary.assert_called_once()
 
 
 @patch("app.services.partition.get_vector_store")
@@ -100,3 +106,86 @@ def test_save_chunks_to_vector_store_skips_missing_index(mock_get_vector_store):
     documents = [Document(page_content="chunk text", metadata={"session_id": 42, "file_url": "https://example.com/doc.pdf"})]
 
     save_chunks_to_vector_store(documents, session_id=42)
+
+
+@patch("app.services.partition.helpers.bulk")
+@patch("app.services.partition.ensure_chunks_index")
+@patch("app.services.partition.get_elasticsearch_client")
+@patch("app.services.partition.get_settings")
+def test_save_chunks_to_keyword_search_indexes_session_scoped_content(
+    mock_get_settings,
+    mock_get_client,
+    mock_ensure_index,
+    mock_bulk,
+):
+    mock_get_settings.return_value.elasticsearch_index_name = "knowledge-chunks"
+    mock_bulk.return_value = (1, [])
+    documents = [
+        Document(
+            page_content="A searchable chunk summary",
+            metadata={
+                "chunk_id": "chunk-1",
+                "knowledge_id": 24,
+                "file_url": "https://example.com/doc.pdf",
+                "original_content": '{"raw_text": "original words"}',
+            },
+        )
+    ]
+
+    save_chunks_to_keyword_search(documents, session_id=42)
+
+    action = mock_bulk.call_args.args[1][0]
+    assert action["_id"] == "chunk-1"
+    assert action["_index"] == "knowledge-chunks"
+    assert action["_source"] == {
+        "chunk_id": "chunk-1",
+        "session_id": 42,
+        "knowledge_id": 24,
+        "file_url": "https://example.com/doc.pdf",
+        "content": "A searchable chunk summary",
+        "original_content": '{"raw_text": "original words"}',
+    }
+    mock_get_client.assert_called_once_with()
+    mock_ensure_index.assert_called_once_with()
+
+
+@patch("app.db.elasticsearch_store.get_elasticsearch_client")
+@patch("app.db.elasticsearch_store.get_settings")
+def test_search_chunks_filters_by_session_and_returns_documents(
+    mock_get_settings,
+    mock_get_client,
+):
+    mock_get_settings.return_value.elasticsearch_index_name = "knowledge-chunks"
+    mock_client = Mock()
+    mock_client.indices.exists.return_value = True
+    mock_client.search.return_value = {
+        "hits": {
+            "hits": [
+                {
+                    "_id": "chunk-1",
+                    "_score": 2.5,
+                    "_source": {
+                        "chunk_id": "chunk-1",
+                        "session_id": 42,
+                        "knowledge_id": 24,
+                        "file_url": "https://example.com/doc.pdf",
+                        "content": "Matching chunk",
+                        "original_content": '{"raw_text": "raw"}',
+                    },
+                }
+            ]
+        }
+    }
+    mock_get_client.return_value = mock_client
+
+    results = search_chunks("matching", session_id=42, top_k=3, knowledge_id=24)
+
+    assert len(results) == 1
+    assert results[0].page_content == "Matching chunk"
+    assert results[0].metadata["chunk_id"] == "chunk-1"
+    assert results[0].metadata["bm25_score"] == 2.5
+    query = mock_client.search.call_args.kwargs["query"]
+    assert query["bool"]["filter"] == [
+        {"term": {"session_id": 42}},
+        {"term": {"knowledge_id": 24}},
+    ]

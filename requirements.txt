@@ -4,6 +4,7 @@ annotated-types==0.7.0
 anyio==4.12.1
 click==8.1.8
 dnspython==2.7.0
+elasticsearch>=8.12,<10
 email-validator==2.3.0
 exceptiongroup==1.3.1
 fastapi==0.128.8

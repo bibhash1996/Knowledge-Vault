@@ -6,8 +6,10 @@ from tempfile import TemporaryDirectory
 from typing import List
 from urllib.parse import urlsplit
 from urllib.request import urlopen
+from uuid import uuid4
 import json
 
+from elasticsearch import helpers
 from sqlalchemy.orm import Session
 
 if __package__ in (None, ""):
@@ -25,8 +27,10 @@ from langchain_chroma import Chroma
 from langchain_core.messages import HumanMessage
 
 from app.db.vector_store import get_vector_store
+from app.db.elasticsearch_store import ensure_chunks_index, get_elasticsearch_client
 from app.db.session import SessionLocal
 from app.repositories.original_content import OriginalContentRepository
+from app.core.config import get_settings
 
 import dotenv
 dotenv.load_dotenv() 
@@ -278,12 +282,80 @@ def save_chunks_to_vector_store(chunks: List[Document], session_id: int) -> None
         )
 
     try:
-        vector_store.add_documents(tagged_documents)
+        chunk_ids = [
+            metadata["chunk_id"]
+            for metadata in (doc.metadata or {} for doc in tagged_documents)
+            if metadata.get("chunk_id")
+        ]
+        if len(chunk_ids) == len(tagged_documents):
+            vector_store.add_documents(tagged_documents, ids=chunk_ids)
+        else:
+            vector_store.add_documents(tagged_documents)
     except Exception as exc:  # pragma: no cover - depends on external Pinecone configuration
         print(f"⚠️ Failed to save chunks to vector store for session_id={session_id}: {exc}")
         return
 
     print(f"✅ Saved {len(tagged_documents)} chunks to vector store for session_id={session_id}")
+
+
+def save_chunks_to_keyword_search(chunks: List[Document], session_id: int) -> None:
+    """Persist session-scoped chunks for Elasticsearch BM25 keyword retrieval."""
+    if not chunks:
+        print("ℹ️ No chunks to save to keyword search")
+        return
+
+    try:
+        client = get_elasticsearch_client()
+        ensure_chunks_index()
+        index_name = get_settings().elasticsearch_index_name
+
+        actions = []
+        for chunk in chunks:
+            metadata = dict(chunk.metadata or {})
+            chunk_id = metadata.get("chunk_id")
+            if not chunk_id:
+                raise ValueError(
+                    "Every chunk must have a chunk_id before keyword-search indexing"
+                )
+
+            source = {
+                "chunk_id": str(chunk_id),
+                "session_id": int(session_id),
+                "knowledge_id": metadata.get("knowledge_id"),
+                "file_url": metadata.get("file_url", ""),
+                "content": chunk.page_content,
+                "original_content": metadata.get("original_content", ""),
+            }
+            actions.append(
+                {
+                    "_op_type": "index",
+                    "_index": index_name,
+                    "_id": str(chunk_id),
+                    "_source": source,
+                }
+            )
+
+        indexed_count, errors = helpers.bulk(
+            client,
+            actions,
+            refresh="wait_for",
+            raise_on_error=False,
+        )
+        if errors:
+            raise RuntimeError(
+                f"Elasticsearch failed to index {len(errors)} chunk(s): {errors}"
+            )
+    except Exception as exc:  # pragma: no cover - depends on Elasticsearch configuration
+        print(
+            f"⚠️ Failed to save chunks to keyword search "
+            f"for session_id={session_id}: {exc}"
+        )
+        return
+
+    print(
+        f"✅ Saved {indexed_count} chunks to keyword search "
+        f"for session_id={session_id}"
+    )
 
 
 def run_complete_ingestion_pipeline(
@@ -318,7 +390,18 @@ def run_complete_ingestion_pipeline(
     finally:
         db.close()
 
-    save_chunks_to_vector_store(summarised_chunks, session_id=session_id)
+    indexed_chunks = []
+    for doc in summarised_chunks:
+        metadata = dict(doc.metadata or {})
+        metadata["chunk_id"] = str(uuid4())
+        if knowledge_id is not None:
+            metadata["knowledge_id"] = int(knowledge_id)
+        indexed_chunks.append(
+            Document(page_content=doc.page_content, metadata=metadata)
+        )
+
+    save_chunks_to_vector_store(indexed_chunks, session_id=session_id)
+    save_chunks_to_keyword_search(indexed_chunks, session_id=session_id)
     # print(summarised_chunks[0].metadata)
     print(f"✅ Completed RAG Ingestion Pipeline with {len(summarised_chunks)} summarised chunks")
 
