@@ -17,6 +17,7 @@ from app.services.partition import (
     save_chunks_to_keyword_search,
     save_chunks_to_vector_store,
 )
+from app.services.retrieval import retrieve_chunks
 
 
 def test_settings_accepts_openai_api_key_from_env(monkeypatch):
@@ -189,3 +190,34 @@ def test_search_chunks_filters_by_session_and_returns_documents(
         {"term": {"session_id": 42}},
         {"term": {"knowledge_id": 24}},
     ]
+
+
+@patch("app.services.retrieval.search_chunks")
+@patch("app.services.retrieval.get_vector_store")
+def test_retrieve_chunks_searches_both_stores_with_session_filter(
+    mock_get_vector_store,
+    mock_search_chunks,
+):
+    vector_chunk = Document(page_content="vector result")
+    keyword_chunk = Document(page_content="keyword result")
+    vector_store = Mock()
+    vector_store.similarity_search.return_value = [vector_chunk]
+    mock_get_vector_store.return_value = vector_store
+    mock_search_chunks.return_value = [keyword_chunk]
+
+    results = retrieve_chunks("query", session_id=42, top_k=5)
+
+    vector_store.similarity_search.assert_called_once_with(
+        "query",
+        k=5,
+        filter={"session_id": 42},
+    )
+    mock_search_chunks.assert_called_once_with("query", session_id=42, top_k=5)
+    assert results == {
+        "vector": [vector_chunk],
+        "keyword": [keyword_chunk],
+    }
+
+
+def test_retrieve_chunks_returns_empty_results_for_blank_query():
+    assert retrieve_chunks("  ", session_id=42) == {"vector": [], "keyword": []}
