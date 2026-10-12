@@ -2,6 +2,7 @@ from langchain_core.documents import Document
 import sys
 from pathlib import Path
 from typing import Any
+import cohere
 
 if __package__ in (None, ""):
     project_root = Path(__file__).resolve().parents[2]
@@ -10,6 +11,7 @@ if __package__ in (None, ""):
 
 from app.db.elasticsearch_store import search_chunks
 from app.db.vector_store import get_vector_store
+from app.core.config import get_settings
 
 import dotenv
 dotenv.load_dotenv() 
@@ -91,6 +93,66 @@ def reciprocal_rank_fusion(
     return fused_documents
 
 
+def rerank_chunks(
+    query: str,
+    chunks: list[Document],
+    top_k: int = 10,
+) -> list[Document]:
+    """Rerank RRF candidate chunks with Cohere and return the strongest matches."""
+    if top_k < 1:
+        raise ValueError("top_k must be at least 1")
+    if not query.strip() or not chunks:
+        return []
+
+    settings = get_settings()
+    if not settings.cohere_api_key:
+        raise RuntimeError("COHERE_API_KEY must be configured to rerank chunks")
+
+    client = cohere.ClientV2(api_key=settings.cohere_api_key)
+    response = client.rerank(
+        model=settings.cohere_rerank_model,
+        query=query,
+        documents=[chunk.page_content for chunk in chunks],
+        top_n=min(top_k, len(chunks)),
+    )
+
+    reranked_chunks = []
+    for result in response.results[:top_k]:
+        chunk = chunks[result.index]
+        metadata = dict(chunk.metadata or {})
+        metadata["cohere_score"] = result.relevance_score
+        reranked_chunks.append(
+            Document(page_content=chunk.page_content, metadata=metadata)
+        )
+    return reranked_chunks
+
+
+def retrieve_reranked_chunks(
+    query: str,
+    session_id: int,
+    top_k: int = 10,
+    candidate_k: int | None = None,
+    rrf_k: int = 60,
+) -> list[Document]:
+    """Retrieve an expanded candidate set, fuse it with RRF, then rerank it."""
+    if top_k < 1:
+        raise ValueError("top_k must be at least 1")
+    if candidate_k is None:
+        candidate_k = top_k * 3
+    if candidate_k < top_k:
+        raise ValueError("candidate_k must be greater than or equal to top_k")
+    if not query.strip():
+        return []
+
+    retrieved = retrieve_chunks(query, session_id, top_k=candidate_k)
+    fused_chunks = reciprocal_rank_fusion(
+        retrieved,
+        top_k=candidate_k,
+        rrf_k=rrf_k,
+    )
+    return rerank_chunks(query, fused_chunks, top_k=top_k)
+
+
 
 if __name__ == "__main__":
     # Example usage
@@ -98,7 +160,8 @@ if __name__ == "__main__":
     session_id = 1
     top_k = 10
 
-    results = retrieve_chunks(query, session_id, top_k)
+    candidate_k = top_k * 3
+    results = retrieve_chunks(query, session_id, candidate_k)
     print("Vector Search Results:")
     # for doc in results["vector"]:
     #     print(doc)
@@ -108,6 +171,14 @@ if __name__ == "__main__":
     # for doc in results["keyword"]:
     #     print(doc)
     print(f"Keyword Search Results: {len(results['keyword'])} chunks found.")
-    rrf_results = reciprocal_rank_fusion(results, top_k=top_k, rrf_k=60)
+    rrf_results = reciprocal_rank_fusion(
+        results,
+        top_k=candidate_k,
+        rrf_k=60,
+    )
     print("\nReciprocal Rank Fusion Results:")
     print(f"RRF Results: {len(rrf_results)} chunks found.")
+    reranked_results = rerank_chunks(query, rrf_results, top_k=top_k)
+    print("\nCohere Reranked Results:")
+    print(f"Reranked Results: {len(reranked_results)} chunks found.")
+    print(reranked_results[0])

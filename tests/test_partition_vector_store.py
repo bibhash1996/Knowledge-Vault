@@ -17,7 +17,12 @@ from app.services.partition import (
     save_chunks_to_keyword_search,
     save_chunks_to_vector_store,
 )
-from app.services.retrieval import reciprocal_rank_fusion, retrieve_chunks
+from app.services.retrieval import (
+    reciprocal_rank_fusion,
+    rerank_chunks,
+    retrieve_chunks,
+    retrieve_reranked_chunks,
+)
 
 
 def test_settings_accepts_openai_api_key_from_env(monkeypatch):
@@ -272,3 +277,59 @@ def test_reciprocal_rank_fusion_keeps_documents_without_chunk_ids_separate():
         "vector result",
         "keyword result",
     }
+
+
+@patch("app.services.retrieval.cohere.ClientV2")
+@patch("app.services.retrieval.get_settings")
+def test_rerank_chunks_uses_cohere_order_and_preserves_metadata(
+    mock_get_settings,
+    mock_client_class,
+):
+    mock_get_settings.return_value.cohere_api_key = "test-key"
+    mock_get_settings.return_value.cohere_rerank_model = "rerank-v3.5"
+    mock_client = Mock()
+    mock_client.rerank.return_value.results = [
+        SimpleNamespace(index=1, relevance_score=0.98),
+        SimpleNamespace(index=0, relevance_score=0.72),
+    ]
+    mock_client_class.return_value = mock_client
+    candidates = [
+        Document(page_content="first candidate", metadata={"chunk_id": "first", "rrf_score": 0.04}),
+        Document(page_content="second candidate", metadata={"chunk_id": "second", "rrf_score": 0.03}),
+    ]
+
+    results = rerank_chunks("query", candidates, top_k=1)
+
+    assert len(results) == 1
+    assert results[0].metadata["chunk_id"] == "second"
+    assert results[0].metadata["rrf_score"] == 0.03
+    assert results[0].metadata["cohere_score"] == 0.98
+    mock_client.rerank.assert_called_once_with(
+        model="rerank-v3.5",
+        query="query",
+        documents=["first candidate", "second candidate"],
+        top_n=1,
+    )
+
+
+@patch("app.services.retrieval.rerank_chunks")
+@patch("app.services.retrieval.reciprocal_rank_fusion")
+@patch("app.services.retrieval.retrieve_chunks")
+def test_retrieve_reranked_chunks_expands_candidates_then_applies_rrf(
+    mock_retrieve_chunks,
+    mock_rrf,
+    mock_rerank,
+):
+    retrieved = {"vector": [], "keyword": []}
+    fused = [Document(page_content="fused")]
+    reranked = [Document(page_content="reranked")]
+    mock_retrieve_chunks.return_value = retrieved
+    mock_rrf.return_value = fused
+    mock_rerank.return_value = reranked
+
+    result = retrieve_reranked_chunks("query", session_id=42, top_k=4)
+
+    assert result == reranked
+    mock_retrieve_chunks.assert_called_once_with("query", 42, top_k=12)
+    mock_rrf.assert_called_once_with(retrieved, top_k=12, rrf_k=60)
+    mock_rerank.assert_called_once_with("query", fused, top_k=4)

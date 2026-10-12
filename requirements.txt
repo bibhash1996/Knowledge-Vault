@@ -3,6 +3,7 @@ annotated-doc==0.0.5
 annotated-types==0.7.0
 anyio==4.12.1
 click==8.1.8
+cohere>=5.13,<6
 dnspython==2.7.0
 elasticsearch>=8.12,<10
 email-validator==2.3.0

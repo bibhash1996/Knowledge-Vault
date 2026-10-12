@@ -26,6 +26,10 @@ class Settings(BaseSettings):
     openai_api_key: str = ""
     openai_embedding_model: str = "text-embedding-3-small"
 
+    # Cohere reranking settings
+    cohere_api_key: str = ""
+    cohere_rerank_model: str = "rerank-v3.5"
+
     # Kafka settings
     kafka_bootstrap_servers: str = ""
     kafka_producer_topic: str = ""
