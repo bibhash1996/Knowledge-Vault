@@ -17,7 +17,7 @@ from app.services.partition import (
     save_chunks_to_keyword_search,
     save_chunks_to_vector_store,
 )
-from app.services.retrieval import retrieve_chunks
+from app.services.retrieval import reciprocal_rank_fusion, retrieve_chunks
 
 
 def test_settings_accepts_openai_api_key_from_env(monkeypatch):
@@ -221,3 +221,54 @@ def test_retrieve_chunks_searches_both_stores_with_session_filter(
 
 def test_retrieve_chunks_returns_empty_results_for_blank_query():
     assert retrieve_chunks("  ", session_id=42) == {"vector": [], "keyword": []}
+
+
+def test_reciprocal_rank_fusion_combines_rankings_and_deduplicates_chunks():
+    vector_first = Document(
+        page_content="first from vector",
+        metadata={"chunk_id": "chunk-1", "origin": "vector"},
+    )
+    vector_second = Document(
+        page_content="second from vector",
+        metadata={"chunk_id": "chunk-2"},
+    )
+    keyword_first = Document(
+        page_content="first from keyword",
+        metadata={"chunk_id": "chunk-2", "origin": "keyword"},
+    )
+    keyword_second = Document(
+        page_content="second from keyword",
+        metadata={"chunk_id": "chunk-1"},
+    )
+
+    fused = reciprocal_rank_fusion(
+        {
+            "vector": [vector_first, vector_second],
+            "keyword": [keyword_first, keyword_second],
+        },
+        top_k=2,
+    )
+
+    assert [document.metadata["chunk_id"] for document in fused] == [
+        "chunk-1",
+        "chunk-2",
+    ]
+    assert fused[0].page_content == "first from vector"
+    assert fused[0].metadata["rrf_score"] == 1 / 61 + 1 / 62
+    assert fused[0].metadata["retrieval_sources"] == ["vector", "keyword"]
+    assert fused[1].metadata["rrf_score"] == 1 / 62 + 1 / 61
+
+
+def test_reciprocal_rank_fusion_keeps_documents_without_chunk_ids_separate():
+    fused = reciprocal_rank_fusion(
+        {
+            "vector": [Document(page_content="vector result")],
+            "keyword": [Document(page_content="keyword result")],
+        },
+        top_k=5,
+    )
+
+    assert {document.page_content for document in fused} == {
+        "vector result",
+        "keyword result",
+    }

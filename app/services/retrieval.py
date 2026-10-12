@@ -1,6 +1,7 @@
 from langchain_core.documents import Document
 import sys
 from pathlib import Path
+from typing import Any
 
 if __package__ in (None, ""):
     project_root = Path(__file__).resolve().parents[2]
@@ -42,6 +43,54 @@ def retrieve_chunks(
     }
 
 
+def reciprocal_rank_fusion(
+    retrieved_chunks: dict[str, list[Document]],
+    top_k: int = 10,
+    rrf_k: int = 60,
+) -> list[Document]:
+    """Fuse ranked retrieval lists with RRF, deduplicating shared chunk IDs."""
+    if top_k < 1:
+        raise ValueError("top_k must be at least 1")
+    if rrf_k < 0:
+        raise ValueError("rrf_k cannot be negative")
+
+    fused: dict[str, dict[str, Any]] = {}
+    for source, chunks in retrieved_chunks.items():
+        for rank, chunk in enumerate(chunks, start=1):
+            metadata = dict(chunk.metadata or {})
+            chunk_id = metadata.get("chunk_id")
+            key = str(chunk_id) if chunk_id is not None else f"{source}:{rank}"
+
+            entry = fused.setdefault(
+                key,
+                {
+                    "document": chunk,
+                    "score": 0.0,
+                    "sources": [],
+                },
+            )
+            entry["score"] += 1.0 / (rrf_k + rank)
+            if source not in entry["sources"]:
+                entry["sources"].append(source)
+
+    ranked_entries = sorted(
+        fused.values(),
+        key=lambda entry: entry["score"],
+        reverse=True,
+    )[:top_k]
+
+    fused_documents = []
+    for entry in ranked_entries:
+        document = entry["document"]
+        metadata = dict(document.metadata or {})
+        metadata["rrf_score"] = entry["score"]
+        metadata["retrieval_sources"] = entry["sources"]
+        fused_documents.append(
+            Document(page_content=document.page_content, metadata=metadata)
+        )
+    return fused_documents
+
+
 
 if __name__ == "__main__":
     # Example usage
@@ -59,3 +108,6 @@ if __name__ == "__main__":
     # for doc in results["keyword"]:
     #     print(doc)
     print(f"Keyword Search Results: {len(results['keyword'])} chunks found.")
+    rrf_results = reciprocal_rank_fusion(results, top_k=top_k, rrf_k=60)
+    print("\nReciprocal Rank Fusion Results:")
+    print(f"RRF Results: {len(rrf_results)} chunks found.")
