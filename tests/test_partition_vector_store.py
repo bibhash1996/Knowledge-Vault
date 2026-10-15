@@ -18,6 +18,7 @@ from app.services.partition import (
     save_chunks_to_vector_store,
 )
 from app.services.retrieval import (
+    populate_content_references,
     reciprocal_rank_fusion,
     rerank_chunks,
     retrieve_chunks,
@@ -333,3 +334,60 @@ def test_retrieve_reranked_chunks_expands_candidates_then_applies_rrf(
     mock_retrieve_chunks.assert_called_once_with("query", 42, top_k=12)
     mock_rrf.assert_called_once_with(retrieved, top_k=12, rrf_k=60)
     mock_rerank.assert_called_once_with("query", fused, top_k=4)
+
+
+def test_populate_content_references_adds_stored_values_to_chunks():
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    chunk = None
+
+    with Session(engine) as db:
+        db.add(SessionModel(id=42, email="content@example.com"))
+        db.flush()
+        knowledge = Knowledge(
+            session_id=42,
+            url="https://example.com/doc.pdf",
+            status="completed",
+        )
+        db.add(knowledge)
+        db.flush()
+        stored_content = OriginalContent(
+            session_id=42,
+            knowledge_id=knowledge.id,
+            entity_type="table",
+            value="<table><tr><td>42</td></tr></table>",
+        )
+        db.add(stored_content)
+        db.flush()
+
+        chunk = Document(
+            page_content="table summary",
+            metadata={
+                "session_id": 42,
+                "original_content": json.dumps(
+                    {
+                        "raw_text": "raw text",
+                        "content_references": [
+                            {"entity_type": "table", "id": stored_content.id}
+                        ],
+                    }
+                ),
+                "cohere_score": 0.9,
+            },
+        )
+        stored_content_id = stored_content.id
+        db.commit()
+
+    with patch("app.services.retrieval.SessionLocal", return_value=Session(engine)):
+        hydrated = populate_content_references([chunk], session_id=42)
+
+    hydrated_content = json.loads(hydrated[0].metadata["original_content"])
+    assert hydrated_content["content_references"] == [
+        {
+            "entity_type": "table",
+            "id": stored_content_id,
+            "value": "<table><tr><td>42</td></tr></table>",
+        }
+    ]
+    assert hydrated_content["raw_text"] == "raw text"
+    assert hydrated[0].metadata["cohere_score"] == 0.9

@@ -408,7 +408,7 @@ def run_complete_ingestion_pipeline(
 if __name__ == "__main__":
     # Example usage
     # print("Partitioning PDF file...")
-    # file_path = "https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf"
-    file_path = "https://www.sldttc.org/allpdf/21583473018.pdf"
+    # file_path = "https://www.sldttc.org/allpdf/21583473018.pdf"
+    file_path = "https://people.irisa.fr/Anthony.Baire/docker-tutorial.pdf"
     # partitioned_elements = partition_pdf_file(file_path)
     chunked_elements = run_complete_ingestion_pipeline(file_path, session_id=1,knowledge_id=2)

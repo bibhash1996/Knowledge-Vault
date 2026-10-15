@@ -3,6 +3,8 @@ import sys
 from pathlib import Path
 from typing import Any
 import cohere
+import json
+from sqlalchemy import select
 
 if __package__ in (None, ""):
     project_root = Path(__file__).resolve().parents[2]
@@ -11,7 +13,9 @@ if __package__ in (None, ""):
 
 from app.db.elasticsearch_store import search_chunks
 from app.db.vector_store import get_vector_store
+from app.db.session import SessionLocal
 from app.core.config import get_settings
+from app.models.original_content import OriginalContent
 
 import dotenv
 dotenv.load_dotenv() 
@@ -150,35 +154,85 @@ def retrieve_reranked_chunks(
         top_k=candidate_k,
         rrf_k=rrf_k,
     )
-    return rerank_chunks(query, fused_chunks, top_k=top_k)
+    reranked_chunks = rerank_chunks(query, fused_chunks, top_k=top_k)
+    return populate_content_references(reranked_chunks, session_id=session_id)
+
+
+def populate_content_references(
+    chunks: list[Document],
+    session_id: int,
+) -> list[Document]:
+    """Add stored table/image values to each chunk's original-content references."""
+    parsed_content: list[dict[str, Any] | None] = []
+    referenced_ids: set[int] = set()
+
+    for chunk in chunks:
+        metadata = dict(chunk.metadata or {})
+        original_content = metadata.get("original_content")
+        if not original_content:
+            parsed_content.append(None)
+            continue
+
+        content = (
+            json.loads(original_content)
+            if isinstance(original_content, str)
+            else dict(original_content)
+        )
+        references = content.get("content_references", [])
+        if not isinstance(references, list):
+            raise ValueError("original_content.content_references must be a list")
+        for reference in references:
+            if not isinstance(reference, dict) or "id" not in reference:
+                raise ValueError("Each content reference must be an object with an id")
+            referenced_ids.add(int(reference["id"]))
+        parsed_content.append(content)
+
+    if not referenced_ids:
+        return chunks
+
+    with SessionLocal() as db:
+        rows = db.scalars(
+            select(OriginalContent).where(
+                OriginalContent.id.in_(referenced_ids),
+                OriginalContent.session_id == int(session_id),
+            )
+        ).all()
+
+    rows_by_id = {row.id: row for row in rows}
+    hydrated_chunks = []
+    for chunk, content in zip(chunks, parsed_content):
+        if content is None:
+            hydrated_chunks.append(chunk)
+            continue
+
+        hydrated_references = []
+        for reference in content.get("content_references", []):
+            row_id = int(reference["id"])
+            row = rows_by_id.get(row_id)
+            if row is None:
+                raise ValueError(
+                    f"Original content row {row_id} was not found for "
+                    f"session_id={session_id}"
+                )
+            hydrated_references.append({**reference, "value": row.value})
+
+        content["content_references"] = hydrated_references
+        metadata = dict(chunk.metadata or {})
+        metadata["original_content"] = json.dumps(content)
+        hydrated_chunks.append(
+            Document(page_content=chunk.page_content, metadata=metadata)
+        )
+    return hydrated_chunks
 
 
 
 if __name__ == "__main__":
     # Example usage
-    query = "what are the key recommendations or guidelines provided in the document?"
+    query = "What problems does Docker solve in the software development and deployment lifecycle?"
     session_id = 1
-    top_k = 10
+    top_k = 5
 
-    candidate_k = top_k * 3
-    results = retrieve_chunks(query, session_id, candidate_k)
-    print("Vector Search Results:")
-    # for doc in results["vector"]:
-    #     print(doc)
-    print(f"Vector Search Results: {len(results['vector'])} chunks found.")
-
-    print("\nKeyword Search Results:")
-    # for doc in results["keyword"]:
-    #     print(doc)
-    print(f"Keyword Search Results: {len(results['keyword'])} chunks found.")
-    rrf_results = reciprocal_rank_fusion(
-        results,
-        top_k=candidate_k,
-        rrf_k=60,
-    )
-    print("\nReciprocal Rank Fusion Results:")
-    print(f"RRF Results: {len(rrf_results)} chunks found.")
-    reranked_results = rerank_chunks(query, rrf_results, top_k=top_k)
+    reranked_results = retrieve_reranked_chunks(query, 1,5,10)
     print("\nCohere Reranked Results:")
     print(f"Reranked Results: {len(reranked_results)} chunks found.")
     print(reranked_results[0])
