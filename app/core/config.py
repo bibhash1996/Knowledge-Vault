@@ -29,6 +29,7 @@ class Settings(BaseSettings):
     # Cohere reranking settings
     cohere_api_key: str = ""
     cohere_rerank_model: str = "rerank-v3.5"
+    cohere_rerank_min_interval_seconds: float = 6.2
 
     # Kafka settings
     kafka_bootstrap_servers: str = ""

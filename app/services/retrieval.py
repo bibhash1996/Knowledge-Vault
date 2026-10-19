@@ -4,7 +4,11 @@ from pathlib import Path
 from typing import Any
 import cohere
 import json
+import logging
+import threading
+import time
 from sqlalchemy import select
+from cohere.errors import TooManyRequestsError
 
 if __package__ in (None, ""):
     project_root = Path(__file__).resolve().parents[2]
@@ -20,6 +24,11 @@ from app.models.original_content import OriginalContent
 import dotenv
 dotenv.load_dotenv() 
 
+logger = logging.getLogger(__name__)
+_cohere_rate_limit_lock = threading.Lock()
+_next_cohere_request_at = 0.0
+
+
 def retrieve_chunks(
     query: str,
     session_id: int,
@@ -30,18 +39,20 @@ def retrieve_chunks(
         return {"vector": [], "keyword": []}
     if top_k < 1:
         raise ValueError("top_k must be at least 1")
-
+    print(f"Retrieving chunks for query: {query}, session_id: {session_id}, top_k: {top_k}")
     vector_store = get_vector_store()
     vector_chunks = vector_store.similarity_search(
         query,
         k=top_k,
         filter={"session_id": int(session_id)},
     )
+    print(f"Retrieved {len(vector_chunks)} vector chunks for query: {query}")
     keyword_chunks = search_chunks(
         query,
         session_id=int(session_id),
         top_k=top_k,
     )
+    print(f"Retrieved {len(vector_chunks)} vector chunks and {len(keyword_chunks)} keyword chunks for query: {query}")
 
     return {
         "vector": vector_chunks,
@@ -111,14 +122,28 @@ def rerank_chunks(
     settings = get_settings()
     if not settings.cohere_api_key:
         raise RuntimeError("COHERE_API_KEY must be configured to rerank chunks")
+    if settings.cohere_rerank_min_interval_seconds < 0:
+        raise ValueError("COHERE_RERANK_MIN_INTERVAL_SECONDS cannot be negative")
 
     client = cohere.ClientV2(api_key=settings.cohere_api_key)
-    response = client.rerank(
-        model=settings.cohere_rerank_model,
-        query=query,
-        documents=[chunk.page_content for chunk in chunks],
-        top_n=min(top_k, len(chunks)),
-    )
+    request = {
+        "model": settings.cohere_rerank_model,
+        "query": query,
+        "documents": [chunk.page_content for chunk in chunks],
+        "top_n": min(top_k, len(chunks)),
+    }
+    _wait_for_cohere_rate_limit(settings.cohere_rerank_min_interval_seconds)
+    try:
+        response = client.rerank(**request)
+    except TooManyRequestsError as exc:
+        retry_after = _cohere_retry_after_seconds(exc)
+        logger.warning(
+            "Cohere rate limit reached; retrying rerank after %.1f seconds",
+            retry_after,
+        )
+        time.sleep(retry_after)
+        _wait_for_cohere_rate_limit(settings.cohere_rerank_min_interval_seconds)
+        response = client.rerank(**request)
 
     reranked_chunks = []
     for result in response.results[:top_k]:
@@ -129,6 +154,34 @@ def rerank_chunks(
             Document(page_content=chunk.page_content, metadata=metadata)
         )
     return reranked_chunks
+
+
+def _wait_for_cohere_rate_limit(min_interval_seconds: float) -> None:
+    global _next_cohere_request_at
+
+    with _cohere_rate_limit_lock:
+        delay = max(0.0, _next_cohere_request_at - time.monotonic())
+        if delay:
+            time.sleep(delay)
+        _next_cohere_request_at = time.monotonic() + min_interval_seconds
+
+
+def _cohere_retry_after_seconds(error: TooManyRequestsError) -> float:
+    headers = error.headers or {}
+    retry_after = next(
+        (
+            value
+            for key, value in headers.items()
+            if key.lower() == "retry-after"
+        ),
+        None,
+    )
+    if retry_after is not None:
+        try:
+            return max(0.0, float(retry_after))
+        except (TypeError, ValueError):
+            logger.warning("Ignoring invalid Cohere Retry-After value: %r", retry_after)
+    return 60.0
 
 
 def retrieve_reranked_chunks(

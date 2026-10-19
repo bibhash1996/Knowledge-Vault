@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from langchain_core.documents import Document
+from cohere.errors import TooManyRequestsError
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 
@@ -23,6 +24,10 @@ from app.services.retrieval import (
     rerank_chunks,
     retrieve_chunks,
     retrieve_reranked_chunks,
+)
+from app.services.retrieval_metrics import (
+    aggregate_query_metrics,
+    calculate_query_metrics,
 )
 
 
@@ -288,6 +293,7 @@ def test_rerank_chunks_uses_cohere_order_and_preserves_metadata(
 ):
     mock_get_settings.return_value.cohere_api_key = "test-key"
     mock_get_settings.return_value.cohere_rerank_model = "rerank-v3.5"
+    mock_get_settings.return_value.cohere_rerank_min_interval_seconds = 0
     mock_client = Mock()
     mock_client.rerank.return_value.results = [
         SimpleNamespace(index=1, relevance_score=0.98),
@@ -311,6 +317,38 @@ def test_rerank_chunks_uses_cohere_order_and_preserves_metadata(
         documents=["first candidate", "second candidate"],
         top_n=1,
     )
+
+
+@patch("app.services.retrieval._wait_for_cohere_rate_limit")
+@patch("app.services.retrieval.time.sleep")
+@patch("app.services.retrieval.cohere.ClientV2")
+@patch("app.services.retrieval.get_settings")
+def test_rerank_chunks_retries_cohere_429_after_retry_after(
+    mock_get_settings,
+    mock_client_class,
+    mock_sleep,
+    mock_wait,
+):
+    mock_get_settings.return_value.cohere_api_key = "test-key"
+    mock_get_settings.return_value.cohere_rerank_model = "rerank-v3.5"
+    mock_get_settings.return_value.cohere_rerank_min_interval_seconds = 6.2
+    mock_client = Mock()
+    mock_client.rerank.side_effect = [
+        TooManyRequestsError(body={"message": "rate limited"}, headers={"Retry-After": "2"}),
+        SimpleNamespace(results=[SimpleNamespace(index=0, relevance_score=0.9)]),
+    ]
+    mock_client_class.return_value = mock_client
+
+    results = rerank_chunks(
+        "query",
+        [Document(page_content="candidate", metadata={"chunk_id": "chunk-1"})],
+    )
+
+    assert len(results) == 1
+    assert results[0].metadata["cohere_score"] == 0.9
+    mock_sleep.assert_called_once_with(2.0)
+    assert mock_wait.call_count == 2
+    assert mock_client.rerank.call_count == 2
 
 
 @patch("app.services.retrieval.rerank_chunks")
@@ -391,3 +429,44 @@ def test_populate_content_references_adds_stored_values_to_chunks():
     ]
     assert hydrated_content["raw_text"] == "raw text"
     assert hydrated[0].metadata["cohere_score"] == 0.9
+
+
+def test_calculate_query_metrics_uses_relevance_grades_and_rank():
+    metrics = calculate_query_metrics(
+        ["chunk-a", "chunk-b", "chunk-c"],
+        {"chunk-a": 3, "chunk-c": 1},
+        cutoffs=(1, 2, 3),
+    )
+
+    assert metrics["recall@2"] == 0.5
+    assert metrics["precision@2"] == 0.5
+    assert metrics["ndcg@2"] == 7 / (7 + 1 / 1.584962500721156)
+    assert metrics["mrr@3"] == 1.0
+
+
+def test_calculate_query_metrics_returns_none_for_unanswerable_query():
+    metrics = calculate_query_metrics(
+        ["chunk-a"],
+        {},
+        cutoffs=(1, 5),
+    )
+
+    assert metrics["recall@1"] is None
+    assert metrics["precision@1"] is None
+    assert metrics["ndcg@5"] is None
+    assert metrics["mrr@5"] is None
+
+
+def test_aggregate_query_metrics_macro_averages_defined_values():
+    summary = aggregate_query_metrics(
+        [
+            {"recall@5": 1.0, "ndcg@5": 0.8},
+            {"recall@5": 0.5, "ndcg@5": None},
+        ]
+    )
+
+    assert summary["query_count"] == 2
+    assert summary["recall@5"] == 0.75
+    assert summary["recall@5_query_count"] == 2
+    assert summary["ndcg@5"] == 0.8
+    assert summary["ndcg@5_query_count"] == 1
